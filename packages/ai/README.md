@@ -1417,6 +1417,7 @@ interface OpenAICompletionsCompat {
   thinkingTokenBudgetField?: 'thinking_token_budget' | 'thinking_budget' | 'thinking_budget_tokens'; // Top-level field that caps reasoning tokens from thinkingBudgets (vLLM / Qwen / llama.cpp). Off by default.
   supportsThinkingTokenBudget?: boolean; // Alias for thinkingTokenBudgetField: 'thinking_token_budget' (vLLM). Prefer thinkingTokenBudgetField. Default: false.
   cacheControlFormat?: 'anthropic';  // Anthropic-style cache_control on system prompt, last tool, and last user/assistant text content
+  inbandToolFormat?: 'minicpm5';     // Parse tool calls the model writes into the text stream; 'minicpm5' reads `<function name><param name>` XML from `delta.content` (default: auto-detected from a MiniCPM5 model id)
   openRouterRouting?: OpenRouterRouting; // OpenRouter routing preferences (default: {})
   vercelGatewayRouting?: VercelGatewayRouting; // Vercel AI Gateway routing preferences (default: {})
 }

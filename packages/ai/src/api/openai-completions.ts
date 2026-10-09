@@ -40,6 +40,7 @@ import { AssistantMessageEventStream } from "../utils/event-stream.ts";
 import { shortHash } from "../utils/hash.ts";
 import { headersToRecord } from "../utils/headers.ts";
 import { parseStreamingJson } from "../utils/json-parse.ts";
+import { type MiniCPM5ScanEvent, MiniCPM5Scanner } from "../utils/minicpm5-tool-parser.ts";
 import { getPiUserAgent } from "../utils/pi-user-agent.ts";
 import { getProviderEnvValue } from "../utils/provider-env.ts";
 import { retryProviderRequest } from "../utils/provider-retry.ts";
@@ -175,6 +176,7 @@ type ResolvedOpenAICompletionsCompat = Omit<
 	| "supportsMidConvoSystemMessages"
 	| "supportsMidConvoToolAdditions"
 	| "vllmPriority"
+	| "inbandToolFormat"
 > & {
 	cacheControlFormat?: OpenAICompletionsCompat["cacheControlFormat"];
 	supportsThinkingTokenBudget?: OpenAICompletionsCompat["supportsThinkingTokenBudget"];
@@ -182,6 +184,7 @@ type ResolvedOpenAICompletionsCompat = Omit<
 	supportsMidConvoSystemMessages?: OpenAICompletionsCompat["supportsMidConvoSystemMessages"];
 	supportsMidConvoToolAdditions?: OpenAICompletionsCompat["supportsMidConvoToolAdditions"];
 	vllmPriority?: OpenAICompletionsCompat["vllmPriority"];
+	inbandToolFormat?: OpenAICompletionsCompat["inbandToolFormat"];
 };
 
 type ResolvedChatTemplateKwargValue = string | number | boolean | null;
@@ -496,6 +499,53 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
 				}
 				return thinkingBlock;
 			};
+			const appendText = (delta: string) => {
+				const block = ensureTextBlock();
+				block.text += delta;
+				stream.push({
+					type: "text_delta",
+					contentIndex: getContentIndex(block),
+					delta,
+					partial: output,
+				});
+			};
+			const inbandScanner =
+				compat.inbandToolFormat === "minicpm5"
+					? new MiniCPM5Scanner({ tools: getDeclaredTools(normalizedContext.messages) })
+					: undefined;
+			let hasInbandToolCall = false;
+			const applyInbandEvents = (events: MiniCPM5ScanEvent[]) => {
+				for (const event of events) {
+					if (event.type === "text") {
+						appendText(event.text);
+					} else if (event.type === "thinkingDelta") {
+						const block = ensureThinkingBlock("reasoning_content");
+						block.thinking += event.delta;
+						stream.push({
+							type: "thinking_delta",
+							contentIndex: getContentIndex(block),
+							delta: event.delta,
+							partial: output,
+						});
+					} else if (event.type === "toolEnd") {
+						// The scanner only emits a call once it is complete, so the whole argument
+						// object arrives as a single delta; finishBlock re-parses partialArgs.
+						const partialArgs = JSON.stringify(event.arguments);
+						const block: StreamingToolCallBlock = {
+							type: "toolCall",
+							id: event.id,
+							name: event.name,
+							arguments: event.arguments as ToolCall["arguments"],
+							partialArgs,
+						};
+						blocks.push(block);
+						hasInbandToolCall = true;
+						const contentIndex = getContentIndex(block);
+						stream.push({ type: "toolcall_start", contentIndex, partial: output });
+						stream.push({ type: "toolcall_delta", contentIndex, delta: partialArgs, partial: output });
+					}
+				}
+			};
 			const ensureToolCallBlock = (toolCall: StreamingToolCallDelta) => {
 				const streamIndex = typeof toolCall.index === "number" ? toolCall.index : undefined;
 				const name = toolCall.function?.name ?? toolCall.custom?.name ?? "";
@@ -594,14 +644,11 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
 						choice.delta.content !== undefined &&
 						choice.delta.content.length > 0
 					) {
-						const block = ensureTextBlock();
-						block.text += choice.delta.content;
-						stream.push({
-							type: "text_delta",
-							contentIndex: getContentIndex(block),
-							delta: choice.delta.content,
-							partial: output,
-						});
+						if (inbandScanner) {
+							applyInbandEvents(inbandScanner.feed(choice.delta.content));
+						} else {
+							appendText(choice.delta.content);
+						}
 					}
 
 					// Some endpoints return reasoning in reasoning_content (llama.cpp),
@@ -682,8 +729,12 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
 				}
 			}
 
+			if (inbandScanner) applyInbandEvents(inbandScanner.flush());
 			for (const block of blocks) {
 				finishBlock(block);
+			}
+			if (hasInbandToolCall && output.stopReason === "stop") {
+				output.stopReason = "toolUse";
 			}
 			if (options?.signal?.aborted) {
 				throw new Error("Request was aborted");
@@ -1679,6 +1730,8 @@ function detectCompat(model: Model<"openai-completions">): ResolvedOpenAIComplet
 		cacheControlFormat,
 		sendSessionAffinityHeaders: isOpenRouter,
 		sessionAffinityFormat: isOpenRouter ? "openrouter" : "openai",
+		// MiniCPM5 writes <function>/<param> calls into the text stream; native tool_calls deltas are unaffected.
+		inbandToolFormat: /minicpm-?5/i.test(model.id) ? "minicpm5" : undefined,
 		supportsLongCacheRetention: !(
 			isTogether ||
 			isCloudflareWorkersAI ||
@@ -1730,5 +1783,6 @@ function getCompat(model: Model<"openai-completions">): ResolvedOpenAICompletion
 		sessionAffinityFormat: model.compat.sessionAffinityFormat ?? detected.sessionAffinityFormat,
 		supportsLongCacheRetention: model.compat.supportsLongCacheRetention ?? detected.supportsLongCacheRetention,
 		vllmPriority: model.compat.vllmPriority,
+		inbandToolFormat: model.compat.inbandToolFormat ?? detected.inbandToolFormat,
 	};
 }

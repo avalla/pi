@@ -341,6 +341,12 @@ export const OpenAICompletionsCompatSchema = Type.Object(
 					"vLLM scheduler priority sent as the top-level priority request field. Lower values are handled earlier and the server default is 0. Only meaningful with --scheduling-policy priority. Off by default and not set on the generated catalog.",
 			}),
 		),
+		inbandToolFormat: Type.Optional(
+			Type.Literal("minicpm5", {
+				description:
+					"Parse tool calls the model writes into the text stream. minicpm5 reads MiniCPM5's native <function name><param name> XML from delta.content. Default: auto-detected from a MiniCPM5 model id.",
+			}),
+		),
 	},
 	{
 		description:
